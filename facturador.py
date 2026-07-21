@@ -296,8 +296,23 @@ def _pdf(res, items, receptor="", doc_tipo=99, doc_nro=0):
         return None
 
 
+def _ensure_pdf_libs():
+    """Red de seguridad: si el contenedor arranca sin las libs del PDF (p.ej. un redeploy
+    de EasyPanel que revierte el command), las instala al boot. No-op si ya están."""
+    try:
+        import fpdf, segno  # noqa: F401
+    except Exception:
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir", "-q",
+                            "fpdf2", "segno"], check=True)
+            _log("PDF libs instaladas en el arranque")
+        except Exception as e:
+            _log(f"No pude instalar libs PDF al boot: {e} (la factura sale igual, sin PDF)")
+
+
 # ---- HTTP server ----
 def serve(port):
+    _ensure_pdf_libs()
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class H(BaseHTTPRequestHandler):
