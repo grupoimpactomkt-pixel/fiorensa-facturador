@@ -33,6 +33,11 @@ CERT = _b64_a_archivo(os.environ["ARCA_CERT_B64"], "_cert.pem") if os.environ.ge
 KEY  = _b64_a_archivo(os.environ["ARCA_KEY_B64"],  "_key.pem")  if os.environ.get("ARCA_KEY_B64")  else os.environ.get("ARCA_KEY",  os.path.join(BASE, "fiorensa.key"))
 CUIT = os.environ.get("ARCA_CUIT", "30719011396")
 PTOVTA_DEF = int(os.environ.get("ARCA_PTOVTA", "6"))
+# datos para el PDF del comprobante (pisables por env)
+RAZON_SOCIAL = os.environ.get("ARCA_RAZON", "FIORENSA GLOBAL FOODS S.A.")
+DOMICILIO    = os.environ.get("ARCA_DOMICILIO", "Mar del Plata, Buenos Aires")
+IIBB         = os.environ.get("ARCA_IIBB", CUIT)          # convenio multilateral usa el CUIT
+INICIO_ACT   = os.environ.get("ARCA_INICIO", "")          # ej "01/01/2024" (opcional)
 CACHE = os.path.join(BASE, "ta_cache.json")
 SECRET = os.environ.get("ARCA_SECRET", "")   # si está seteado, exige header X-Fact-Token
 LOG = os.path.join(BASE, "facturas.log")
@@ -135,7 +140,7 @@ def _iva_grupos(items):
     return grupos
 
 
-def emitir(ptovta, tipo, doc_tipo, doc_nro, items):
+def emitir(ptovta, tipo, doc_tipo, doc_nro, items, receptor=""):
     cbte = CBTE[tipo]
     grupos = _iva_grupos(items)
     imp_neto = round(sum(g[1] for g in grupos), 2)
@@ -178,11 +183,13 @@ def emitir(ptovta, tipo, doc_tipo, doc_nro, items):
                            f"Errores={errs} Obs={obs}\nRESP:{r[:2000]}")
 
     qr_url = _qr(hoy, ptovta, cbte, nro, imp_tot, doc_tipo, doc_nro, cae.group(1))
-    return {"ok": True, "tipo": tipo, "ptovta": ptovta, "nro": nro,
-            "cae": cae.group(1), "cae_vto": vto.group(1) if vto else "",
-            "importe": imp_tot, "neto": imp_neto, "iva": imp_iva,
-            "fecha": hoy, "cuit": CUIT, "qr_url": qr_url,
-            "obs": [f"{c}: {m}" for c, m in obs]}
+    res = {"ok": True, "tipo": tipo, "ptovta": ptovta, "nro": nro,
+           "cae": cae.group(1), "cae_vto": vto.group(1) if vto else "",
+           "importe": imp_tot, "neto": imp_neto, "iva": imp_iva,
+           "fecha": hoy, "cuit": CUIT, "qr_url": qr_url, "cbte": cbte,
+           "obs": [f"{c}: {m}" for c, m in obs]}
+    res["pdf_b64"] = _pdf(res, items, receptor, doc_tipo, doc_nro)  # None si falla el PDF (la factura ya es válida)
+    return res
 
 
 def _qr(fecha, ptovta, tipo_cmp, nro_cmp, importe, tipo_doc, nro_doc, cae):
@@ -193,6 +200,100 @@ def _qr(fecha, ptovta, tipo_cmp, nro_cmp, importe, tipo_doc, nro_doc, cae):
          "tipoCodAut": "E", "codAut": int(cae)}
     b64 = base64.b64encode(json.dumps(p, separators=(",", ":")).encode()).decode()
     return "https://www.afip.gob.ar/fe/qr/?p=" + b64
+
+
+def _ar(n):
+    """Formato de moneda argentino: 1.234,56"""
+    return f"{n:,.2f}".replace(",", "·").replace(".", ",").replace("·", ".")
+
+
+def _pdf(res, items, receptor="", doc_tipo=99, doc_nro=0):
+    """Comprobante PDF de una carilla con el QR de AFIP. Devuelve base64, o None si falla
+    (la factura AFIP ya es válida sin el PDF; nunca tumbamos la emisión por esto)."""
+    try:
+        from fpdf import FPDF
+        import segno, io
+        _s = lambda x: str(x).encode("latin-1", "replace").decode("latin-1")  # fuente core = Latin-1
+        tipo = res["tipo"]
+        f = res["fecha"]; fstr = f"{f[6:]}/{f[4:6]}/{f[:4]}"
+        vto = res.get("cae_vto", ""); vstr = f"{vto[6:]}/{vto[4:6]}/{vto[:4]}" if len(vto) == 8 else vto
+        comp = f'{res["ptovta"]:04d}-{res["nro"]:08d}'
+        doc_lbl = {80: "CUIT", 96: "DNI", 99: ""}.get(doc_tipo, "Doc")
+        recep_doc = f"{doc_lbl} {doc_nro}" if doc_nro else "Consumidor Final"
+
+        pdf = FPDF(format="A4"); pdf.set_auto_page_break(False); pdf.add_page()
+        L, R, W = 15, 195, 180
+
+        # --- recuadro letra (centro) ---
+        pdf.set_line_width(0.4); pdf.rect(97, 12, 16, 16)
+        pdf.set_font("Helvetica", "B", 26); pdf.set_xy(97, 13); pdf.cell(16, 12, tipo, align="C")
+        pdf.set_font("Helvetica", "", 7); pdf.set_xy(97, 24); pdf.cell(16, 3, f'COD. {res["cbte"]:02d}', align="C")
+
+        # --- emisor (izq) ---
+        pdf.set_xy(L, 13); pdf.set_font("Helvetica", "B", 15); pdf.cell(80, 7, RAZON_SOCIAL)
+        pdf.set_font("Helvetica", "", 8)
+        pdf.set_xy(L, 21); pdf.cell(80, 4, DOMICILIO)
+        pdf.set_xy(L, 25); pdf.cell(80, 4, "IVA Responsable Inscripto")
+
+        # --- comprobante (der) ---
+        pdf.set_font("Helvetica", "B", 13); pdf.set_xy(120, 13); pdf.cell(R - 120, 7, "FACTURA", align="R")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_xy(120, 21); pdf.cell(R - 120, 4, f"N° {comp}", align="R")
+        pdf.set_xy(120, 25); pdf.cell(R - 120, 4, f"Fecha: {fstr}", align="R")
+
+        # --- datos fiscales emisor ---
+        pdf.set_xy(L, 31); pdf.set_font("Helvetica", "", 8)
+        pdf.cell(90, 4, f"CUIT: {res['cuit']}   Ing. Brutos: {IIBB}")
+        if INICIO_ACT:
+            pdf.set_xy(120, 31); pdf.cell(R - 120, 4, f"Inicio actividades: {INICIO_ACT}", align="R")
+        pdf.line(L, 37, R, 37)
+
+        # --- receptor ---
+        pdf.set_xy(L, 39); pdf.set_font("Helvetica", "B", 8); pdf.cell(20, 4, "Cliente:")
+        pdf.set_font("Helvetica", "", 8)
+        pdf.cell(0, 4, _s(f"{receptor or 'Consumidor Final'}   {recep_doc}"))
+        pdf.line(L, 45, R, 45)
+
+        # --- tabla items ---
+        pdf.set_xy(L, 47); pdf.set_font("Helvetica", "B", 8)
+        cols = [(90, "Descripción", "L"), (20, "Cant.", "R"), (35, "P. Unit.", "R"), (35, "Subtotal", "R")]
+        for w, t, a in cols:
+            pdf.cell(w, 6, t, border="B", align=a)
+        pdf.ln(6); pdf.set_font("Helvetica", "", 8); y = pdf.get_y()
+        for it in items:
+            cant = float(it.get("cant", 1)); pu = float(it["precio"]); sub = round(pu * cant, 2)
+            pdf.set_x(L)
+            pdf.cell(90, 5, _s(it.get("desc", ""))[:55], align="L")
+            pdf.cell(20, 5, f"{cant:g}", align="R")
+            pdf.cell(35, 5, _ar(pu), align="R")
+            pdf.cell(35, 5, _ar(sub), align="R")
+            pdf.ln(5)
+
+        # --- totales ---
+        ty = max(pdf.get_y() + 4, 90)
+        pdf.set_font("Helvetica", "", 9)
+        for lbl, val in [("Neto Gravado", res["neto"]), ("IVA", res["iva"])]:
+            pdf.set_xy(120, ty); pdf.cell(40, 5, lbl, align="R")
+            pdf.cell(20, 5, _ar(val), align="R"); ty += 5
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_xy(120, ty + 1); pdf.cell(40, 6, "TOTAL $", align="R")
+        pdf.cell(20, 6, _ar(res["importe"]), align="R")
+
+        # --- QR + CAE (footer) ---
+        qy = 250
+        buff = io.BytesIO()
+        segno.make(res["qr_url"], error="m").save(buff, kind="png", scale=4, border=1)
+        buff.seek(0); pdf.image(buff, x=L, y=qy, w=32)
+        pdf.set_xy(L + 36, qy + 6); pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(0, 5, f'CAE N°: {res["cae"]}'); pdf.ln(5)
+        pdf.set_x(L + 36); pdf.set_font("Helvetica", "", 9)
+        pdf.cell(0, 5, f"Vto. CAE: {vstr}")
+
+        out = pdf.output()  # bytes/bytearray en fpdf2 2.8
+        return base64.b64encode(bytes(out)).decode()
+    except Exception as e:
+        _log(f"PDF omitido: {e}")
+        return None
 
 
 # ---- HTTP server ----
@@ -228,7 +329,8 @@ def serve(port):
                 n = int(self.headers.get("Content-Length", 0))
                 d = json.loads(self.rfile.read(n) or b"{}")
                 res = emitir(int(d.get("ptovta", PTOVTA_DEF)), d.get("tipo", "B"),
-                             int(d.get("doc_tipo", 99)), int(d.get("doc_nro", 0)), d["items"])
+                             int(d.get("doc_tipo", 99)), int(d.get("doc_nro", 0)), d["items"],
+                             d.get("receptor", ""))
                 _log(f'OK tipo={res["tipo"]} pv={res["ptovta"]} nro={res["nro"]} '
                      f'cae={res["cae"]} imp={res["importe"]}')
                 self._send(200, res)
@@ -254,5 +356,19 @@ if __name__ == "__main__":
         print(json.dumps(r, ensure_ascii=False, indent=2))
     elif cmd == "serve":
         serve(int(sys.argv[2]) if len(sys.argv) > 2 else 8077)
+    elif cmd == "pdf-demo":
+        # arma un PDF de muestra SIN emitir contra AFIP (para ver el diseño)
+        demo = {"tipo": "B", "fecha": "20260720", "cae_vto": "20260730", "cbte": 6,
+                "ptovta": 6, "nro": 2, "cae": "86294661836322", "cuit": CUIT,
+                "neto": 1239.67, "iva": 260.33, "importe": 1500.0,
+                "qr_url": _qr("20260720", 6, 6, 2, 1500.0, 99, 0, "86294661836322")}
+        items = [{"desc": "Cerveza Quilmes 1L", "cant": 6, "precio": 200.0, "iva": 21},
+                 {"desc": "Gaseosa Coca 2.25L", "cant": 1, "precio": 300.0, "iva": 21}]
+        b64 = _pdf(demo, items, "COMERCIO 24HS")
+        if not b64:
+            print("PDF falló (ver facturas.log)"); sys.exit(1)
+        out = sys.argv[2] if len(sys.argv) > 2 else "demo_factura.pdf"
+        open(out, "wb").write(base64.b64decode(b64))
+        print(f"PDF de muestra escrito en {out} ({len(b64)} chars b64)")
     else:
         print(__doc__)
