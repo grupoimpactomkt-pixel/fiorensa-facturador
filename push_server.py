@@ -78,6 +78,61 @@ def notify(usuario, titulo, body, url="/"):
     return ok
 
 
+# ---------- usuarios (auto-registro de vendedores, sin tocar Supabase) ----------
+USERS = os.path.join(BASE, "users.json")
+
+
+def _uload():
+    try:
+        return json.load(open(USERS, encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _usave(d):
+    json.dump(d, open(USERS, "w", encoding="utf-8"), ensure_ascii=False)
+
+
+def user_register(data, pins_ocupados):
+    """Registra un vendedor nuevo en estado 'pendiente'. Clave = PIN (único)."""
+    pin = str(data.get("pin", "")).strip()
+    nombre = str(data.get("nombre", "")).strip()
+    if not (pin.isdigit() and 4 <= len(pin) <= 6):
+        return {"ok": False, "error": "El PIN tiene que ser de 4 a 6 números"}
+    if not nombre:
+        return {"ok": False, "error": "Falta el nombre"}
+    d = _uload()
+    if pin in d or pin in (pins_ocupados or []):
+        return {"ok": False, "error": "Ese PIN ya está en uso, elegí otro"}
+    d[pin] = {"pin": pin, "nombre": nombre, "apellido": str(data.get("apellido", "")).strip(),
+              "tel": str(data.get("tel", "")).strip(), "direccion": str(data.get("direccion", "")).strip(),
+              "rol": "vendedor", "estado": "pendiente", "zona": "", "created": data.get("ts", "")}
+    _usave(d)
+    return {"ok": True, "usuario": nombre}
+
+
+def user_pending():
+    return [u for u in _uload().values() if u.get("estado") == "pendiente"]
+
+
+def user_decide(pin, aprobar, zona):
+    d = _uload(); u = d.get(str(pin))
+    if not u:
+        return {"ok": False, "error": "No existe ese registro"}
+    if aprobar:
+        u["estado"] = "aprobado"; u["zona"] = zona or u.get("zona", "")
+    else:
+        del d[str(pin)]
+    _usave(d)
+    return {"ok": True}
+
+
+def user_authmap():
+    """PIN -> datos, solo de los APROBADOS. El router lo mergea con sus PINs fijos para el login."""
+    return {p: {"nombre": u["nombre"], "rol": u.get("rol", "vendedor"), "zona": u.get("zona", "")}
+            for p, u in _uload().items() if u.get("estado") == "aprobado"}
+
+
 def serve(port):
     if webpush is None:
         raise SystemExit("Falta pywebpush (pip install pywebpush)")
@@ -116,6 +171,16 @@ def serve(port):
                     enviados = notify(d["usuario"], d.get("titulo", "Fiore"),
                                       d.get("body", ""), d.get("url", "/"))
                     self._send(200, {"ok": True, "enviados": enviados})
+                elif self.path.startswith("/user_register"):
+                    self._send(200, user_register(d, d.get("pins_ocupados")))
+                elif self.path.startswith("/user_pending"):
+                    self._send(200, {"ok": True, "items": user_pending()})
+                elif self.path.startswith("/user_approve"):
+                    self._send(200, user_decide(d.get("pin"), True, d.get("zona", "")))
+                elif self.path.startswith("/user_reject"):
+                    self._send(200, user_decide(d.get("pin"), False, ""))
+                elif self.path.startswith("/user_authmap"):
+                    self._send(200, {"ok": True, "map": user_authmap()})
                 else:
                     self._send(404, {"ok": False, "error": "ruta"})
             except Exception as e:
