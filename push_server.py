@@ -18,7 +18,7 @@ ENV:
   VAPID_SUB   (mailto: de contacto, ej mailto:info@impactoestudiocreativo.com)
   PUSH_DIR    (dónde persistir subs.json; default junto al script — en el VPS montar un volumen)
 """
-import os, sys, json
+import os, sys, json, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -133,6 +133,57 @@ def user_authmap():
             for p, u in _uload().items() if u.get("estado") == "aprobado"}
 
 
+# ---------- PINs cambiables (SEG-2) + anti-brute-force, sin tocar Supabase ----------
+PINS_F = os.path.join(BASE, "pins.json")    # overrides de PIN por persona: {nombre: {"pin","rol"}}
+FAILS_F = os.path.join(BASE, "fails.json")  # anti-fuerza-bruta por IP: {ip: {"n":int,"ts":float}}
+LOCK_MAX = 8        # intentos fallidos antes de bloquear
+LOCK_WINDOW = 600   # ventana para contar fallos (10 min)
+LOCK_BLOCK = 900    # tiempo de bloqueo una vez pasado el tope (15 min)
+
+
+def _jload(f):
+    try:
+        return json.load(open(f, encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _jsave(f, d):
+    json.dump(d, open(f, "w", encoding="utf-8"), ensure_ascii=False)
+
+
+def set_pin(nombre, nuevo, rol):
+    nombre = str(nombre or "").strip(); nuevo = str(nuevo or "").strip()
+    if not nombre or not (nuevo.isdigit() and len(nuevo) == 6):
+        return {"ok": False, "error": "PIN nuevo inválido (6 números)"}
+    d = _jload(PINS_F); d[nombre] = {"pin": nuevo, "rol": rol or "vendedor"}; _jsave(PINS_F, d)
+    return {"ok": True}
+
+
+def pinmap():
+    """Lo que consume el router para armar su mapa de login: overrides (cambios) + aprobados."""
+    return {"ok": True, "overrides": _jload(PINS_F), "map": user_authmap()}
+
+
+def login_gate(ip, ok):
+    """Registra el intento de login por IP y devuelve si está bloqueado. ok=True resetea."""
+    ip = str(ip or "?"); now = time.time(); d = _jload(FAILS_F); e = d.get(ip)
+    if e and (now - e.get("ts", 0) > LOCK_WINDOW) and e.get("n", 0) < LOCK_MAX:
+        e = None  # ventana vencida sin haber llegado al tope -> reset
+    if ok:
+        if ip in d:
+            del d[ip]; _jsave(FAILS_F, d)
+        return {"ok": True, "allow": True, "blocked": False}
+    # bloqueado activo?
+    if e and e.get("n", 0) >= LOCK_MAX and now - e.get("ts", 0) < LOCK_BLOCK:
+        return {"ok": True, "allow": False, "blocked": True, "wait": int(LOCK_BLOCK - (now - e["ts"]))}
+    n = (e.get("n", 0) if e else 0) + 1
+    d[ip] = {"n": n, "ts": now}; _jsave(FAILS_F, d)
+    blocked = n >= LOCK_MAX
+    return {"ok": True, "allow": False, "blocked": blocked,
+            "wait": LOCK_BLOCK if blocked else 0, "restantes": max(0, LOCK_MAX - n)}
+
+
 def serve(port):
     if webpush is None:
         raise SystemExit("Falta pywebpush (pip install pywebpush)")
@@ -181,6 +232,12 @@ def serve(port):
                     self._send(200, user_decide(d.get("pin"), False, ""))
                 elif self.path.startswith("/user_authmap"):
                     self._send(200, {"ok": True, "map": user_authmap()})
+                elif self.path.startswith("/pinmap"):
+                    self._send(200, pinmap())
+                elif self.path.startswith("/set_pin"):
+                    self._send(200, set_pin(d.get("nombre"), d.get("nuevo"), d.get("rol")))
+                elif self.path.startswith("/login_gate"):
+                    self._send(200, login_gate(d.get("ip"), bool(d.get("ok"))))
                 else:
                     self._send(404, {"ok": False, "error": "ruta"})
             except Exception as e:
