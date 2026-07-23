@@ -102,6 +102,9 @@ def user_register(data, pins_ocupados):
     if not nombre:
         return {"ok": False, "error": "Falta el nombre"}
     d = _uload()
+    # SEG-7: tope de pendientes para que un tercero no spamee el auto-registro / llene el disco
+    if len([1 for u in d.values() if u.get("estado") == "pendiente"]) >= 25:
+        return {"ok": False, "error": "Hay demasiados registros pendientes. Avisá a un admin."}
     if pin in d or pin in (pins_ocupados or []):
         return {"ok": False, "error": "Ese PIN ya está en uso, elegí otro"}
     d[pin] = {"pin": pin, "nombre": nombre, "apellido": str(data.get("apellido", "")).strip(),
